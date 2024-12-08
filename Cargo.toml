@@ -1,0 +1,10 @@
+[package]
+name = "warp-ws-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+futures-util = "0.3"
