@@ -1,4 +1,3 @@
-// Step 1: Importing necessary dependencies
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,102 +10,87 @@ use tokio_tungstenite::{
 };
 use futures_util::{SinkExt, StreamExt};
 
-// Step 2: Create a shared state for managing connections
 struct ChatServer {
-    // Broadcast channel for sending messages to all clients
-    tx: broadcast::Sender<String>,
-    
-    // Track connected client addresses
-    clients: Arc<Mutex<HashMap<SocketAddr, broadcast::Sender<String>>>>,
+    // Store client information with username
+    clients: Arc<Mutex<HashMap<String, (SocketAddr, broadcast::Sender<String>)>>>,
 }
 
 impl ChatServer {
-    // Constructor method
     fn new() -> Self {
-        // Create a broadcast channel with a buffer of 10 messages
-        let (tx, _) = broadcast::channel(10);
-        
         ChatServer {
-            tx,
             clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    // Method to handle individual client connections
     async fn handle_connection(
         &self,
         raw_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
         addr: SocketAddr,
     ) {
-        // Split the WebSocket stream into sender and receiver
         let (mut ws_sender, mut ws_receiver) = raw_stream.split();
 
-        // Create a receiver for this specific client
-        let rx = self.tx.subscribe();
+        // First message is username
+        let username = match ws_receiver.next().await {
+            Some(Ok(Message::Text(name))) => name.trim().to_string(),
+            _ => return,
+        };
 
-        // Spawn a task to handle incoming messages
-        tokio::spawn({
-            let tx = self.tx.clone();
-            let clients = Arc::clone(&self.clients);
-            
-            async move {
-                // Add this client to the tracked connections
-                {
-                    let mut client_map = clients.lock().await;
-                    client_map.insert(addr, tx.clone());
-                }
+        // Create a personal broadcast channel for this client
+        let (tx, mut rx) = broadcast::channel(10);
 
-                // Receive messages from the client
-                while let Some(message) = ws_receiver.next().await {
-                    match message {
-                        Ok(msg) => match msg {
-                            Message::Text(text) => {
-                                // Broadcast the message to all clients
-                                let _ = tx.send(format!("{}: {}", addr, text));
+        // Add client to global client list
+        {
+            let mut clients = self.clients.lock().await;
+            clients.insert(username.clone(), (addr, tx.clone()));
+        }
+
+        // Incoming message handler
+        let clients_clone = Arc::clone(&self.clients);
+        let username_clone = username.clone();
+        tokio::spawn(async move {
+            while let Some(message) = ws_receiver.next().await {
+                if let Ok(Message::Text(text)) = message {
+                    // Parse direct message
+                    if text.starts_with('@') {
+                        let parts: Vec<&str> = text.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            let target_username = parts[0].trim_start_matches('@');
+                            let message_content = parts[1];
+
+                            let clients = clients_clone.lock().await;
+                            if let Some((_, target_tx)) = clients.get(target_username) {
+                                let dm = format!("[DM from {}]: {}", username_clone, message_content);
+                                let _ = target_tx.send(dm);
                             }
-                            Message::Close(_) => break,
-                            _ => {}
-                        },
-                        Err(_) => break,
+                        }
                     }
                 }
-
-                // Remove client when disconnected
-                let mut client_map = clients.lock().await;
-                client_map.remove(&addr);
             }
         });
 
-        // Spawn a task to handle outgoing messages
-        tokio::spawn({
-            let mut rx = rx;
-            async move {
-                while let Ok(msg) = rx.recv().await {
-                    if ws_sender.send(Message::text(msg)).await.is_err() {
-                        break;
-                    }
+        // Outgoing message handler
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                if ws_sender.send(Message::text(msg)).await.is_err() {
+                    break;
                 }
             }
         });
     }
 
-    // Main server run method
     async fn run(&self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
-        println!("Chat server listening on: {}", addr);
+        println!("Server listening on: {}", addr);
 
         while let Ok((stream, addr)) = listener.accept().await {
             let server = self.clone();
             
-            // Spawn a new task for each WebSocket connection
             tokio::spawn(async move {
-                // Add proper WebSocket upgrade headers
                 match accept_async(stream).await {
                     Ok(ws_stream) => {
-                        println!("New WebSocket connection: {}", addr);
                         server.handle_connection(ws_stream, addr).await;
                     }
-                    Err(e) => eprintln!("Failed to accept WebSocket connection: {}", e),
+                    Err(e) => eprintln!("Connection failed: {}", e),
                 }
             });
         }
@@ -115,25 +99,17 @@ impl ChatServer {
     }
 }
 
-// Implement Clone for ChatServer to allow easy spawning
+// Implement Clone for ChatServer
 impl Clone for ChatServer {
     fn clone(&self) -> Self {
         ChatServer {
-            tx: self.tx.clone(),
             clients: Arc::clone(&self.clients),
         }
     }
 }
 
-// Async main entry point
 #[tokio::main]
 async fn main() -> Result<()> {
     let server = ChatServer::new();
-    match server.run("127.0.0.1:8080").await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            eprintln!("Server error: {}", e);
-            Err(e)
-        }
-    }
+    server.run("127.0.0.1:8080").await
 }
